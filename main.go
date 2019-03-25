@@ -34,31 +34,39 @@ type JFrogResult struct {
 	Range JFrogRange `json:"range"`
 }
 
-type Credentials struct {
+type JFrogTopResults struct {
+	Top1 JFrogResult `json:"top_one"`
+	Top2 JFrogResult `json:"top_two"`
+}
+
+type JFrogConfig struct {
+	api_conf string
 	api_host string
 	api_key	 string
+    api_json string
 }
 
 
 func usage() {
 	fmt.Printf(
-		"Usage: %s [args] ...\n"            +
+		"Usage: %s [args] ...\n"           +
 		"Where arg is:\n"                  +
 		"    -conf=<configuration file>\n" +
 		"    -host=<hostname>\n"           +
-		"    -key=<API key>\n\n",
+		"    -key=<API key>\n"             +
+		"    -json=<Yes|No>\n\n",
 		os.Args[0])
 }
 
-func parseCommandLine(api_conf *string,
-	api_host *string, api_key *string) {
-	if (api_conf == nil || api_host == nil || api_key == nil) {
+func parseCommandLine(config *JFrogConfig) {
+	if config == nil {
 		log.Fatal("parseCommandLine: ERROR: NULL pointer")
 	}
 
-	flag.StringVar(api_conf, "conf", "", "configuration file")
-	flag.StringVar(api_host, "host", "", "hostname")
-	flag.StringVar(api_key, "key", "", "API key")
+	flag.StringVar(&config.api_conf, "conf", "", "Configuration File")
+	flag.StringVar(&config.api_host, "host", "", "Hostname")
+	flag.StringVar(&config.api_key, "key", "", "API Key")
+	flag.StringVar(&config.api_json, "json", "", "Export JSON")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -72,17 +80,17 @@ func parseCommandLine(api_conf *string,
 /*
  *	Read and parse jfrog configuration file. This function will parse
  *	out the API host and key from configuration file into the
- *	corresponding pointers.
+ *	corresponding structure.
  */
-func parseConfigFile(api_conf string, api_host *string, api_key *string) {
-	if api_conf == "" {
-		log.Fatal("parseConfigFile: ERROR: No configuration specified\n")
+func parseConfigFile(config *JFrogConfig) {
+	if config == nil {
+		log.Fatal("parseConfigFile: ERROR: NULL config\n")
 
-	} else if (api_host == nil || api_key == nil) {
-		log.Fatal("parseConfigFile: ERROR: NULL pointer\n")
+	} else if config.api_conf == "" {
+		log.Fatal("parseConfigFile: ERROR: No configuration specified\n")
 	}
 
-	file, err := os.Open(api_conf)
+	file, err := os.Open(config.api_conf)
 	if err != nil {
 		log.Fatal(fmt.Sprintf("parseConfigFile: ERROR: %s\n", err))
 	}
@@ -90,8 +98,9 @@ func parseConfigFile(api_conf string, api_host *string, api_key *string) {
 	defer file.Close()
 
 	/* XXX: plen needs to match ptr array size */
-	plen := 2
-	ptr := [2]*string{0:api_host, 1:api_key}
+	plen := 3
+	ptr := [3]*string{0:&config.api_host,
+		1:&config.api_key, 2:&config.api_json}
 	set := false
 	idx := -1
 
@@ -112,13 +121,15 @@ func parseConfigFile(api_conf string, api_host *string, api_key *string) {
 				 * specified in the configuration file.
 				 */
 				case "api_host":
-					if *api_host == "" {
+					if config.api_host == "" {
 						idx = 0
 					}
 				case "api_key":
-					if *api_key == "" {
+					if config.api_key == "" {
 						idx = 1
 					}
+				case "api_json":
+					idx = 2
 				case "=":
 					set = true
 				default:
@@ -197,13 +208,16 @@ func getTopDownloads(in <-chan *JFrogResult, out chan<- []JFrogItem) {
  *	work as expected for some reason. Therefore, we have to do the work
  *	ourselves.
  */
-func getJFrogItems(out chan<- *JFrogResult, api_host string, api_key string) {
-	if api_host == "" || api_key == "" {
+func getJFrogItems(out chan<- *JFrogResult, config *JFrogConfig) {
+	if config == nil {
+		log.Fatal("getJFrogItems: ERROR: NULL config")
+
+	} else if config.api_host == "" || config.api_key == "" {
 		log.Fatal("getJFrogItems: ERROR: NULL host or api key")
 	}
 
 	api_fmt := "http://%s/artifactory/api/search/aql"
-	api_url := fmt.Sprintf(api_fmt, api_host)
+	api_url := fmt.Sprintf(api_fmt, config.api_host)
 
     payload := `items.find({
 			"name": { "$match" : "*.jar" },
@@ -221,7 +235,7 @@ func getJFrogItems(out chan<- *JFrogResult, api_host string, api_key string) {
 	}
 
 	/* Custom JFrog header for authentication using an API key */
-	req.Header.Set("X-JFrog-Art-Api", api_key)
+	req.Header.Set("X-JFrog-Art-Api", config.api_key)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "text/plain")
 
@@ -248,14 +262,26 @@ func getJFrogItems(out chan<- *JFrogResult, api_host string, api_key string) {
 	out <- results
 }
 
-/*
- *	Show the top 2 downloads. If there are multiple jar files with the
- *	same number of downloads, they are all displayed.
- */
-func showTopTwoDownloads(in <-chan []JFrogItem) {
-	top1 := <-in
-	top2 := <-in
+func showTopDownloadsJSON(top1 []JFrogItem, top2 []JFrogItem) {
+	top1_length := uint64(len(top1))
+	top2_length := uint64(len(top2))
 
+	top1_range := JFrogRange{Start:0, End:top1_length, Total:top1_length}
+	top2_range := JFrogRange{Start:0, End:top2_length, Total:top2_length}
+
+	top1_result := JFrogResult{Items:top1, Range:top1_range}
+	top2_result := JFrogResult{Items:top2, Range:top2_range}
+
+	top_results := JFrogTopResults{Top1:top1_result, Top2:top2_result}
+	top_json, err := json.MarshalIndent(top_results, "", "\t")
+	if err != nil {
+		log.Fatal(fmt.Sprintf("showTopDownloadsJSON: ERROR: JSON Marshal"))
+	}
+
+	fmt.Printf("%s\n", top_json)
+}
+
+func showTopDownloadsNormal(top1 []JFrogItem, top2 []JFrogItem) {
 	top1_downloads := getDownloads(top1)
 	top2_downloads := getDownloads(top2)
 
@@ -272,12 +298,37 @@ func showTopTwoDownloads(in <-chan []JFrogItem) {
 	}
 }
 
+/*
+ *	Show the top 2 downloads. If there are multiple jar files with the
+ *	same number of downloads, they are all displayed. 
+ */
+func showTopTwoDownloads(in <-chan []JFrogItem, config *JFrogConfig) {
+	top1 := <-in
+	top2 := <-in
+
+	show_json := false
+
+	if config.api_json != "" {
+		api_json := strings.ToLower(config.api_json)
+		if api_json == "true" || api_json == "yes" || api_json == "1" {
+			show_json = true
+		}
+	}
+
+	if show_json == true {
+		showTopDownloadsJSON(top1, top2)
+
+	} else {
+		showTopDownloadsNormal(top1, top2)
+	}
+}
+
 func main() {
-	var api_conf, api_host, api_key string
+	var config = JFrogConfig{}
 
 	/* Aquire credentials via command line and/or config file */
-	parseCommandLine(&api_conf, &api_host, &api_key)
-	parseConfigFile(api_conf, &api_host, &api_key)
+	parseCommandLine(&config)
+	parseConfigFile(&config)
 
 	results_ch	:= make(chan *JFrogResult)
 	items_ch	:= make(chan []JFrogItem)
@@ -286,11 +337,11 @@ func main() {
 	defer close(items_ch)
 
 	/* Get JSON items from JFrog artifactory server */
-	go getJFrogItems(results_ch, api_host, api_key)
+	go getJFrogItems(results_ch, &config)
 
 	/* Parse out the top 2 downloads from the returned JSON */
 	go getTopDownloads(results_ch, items_ch)
 
 	/* Show the top 2 downloads */
-	showTopTwoDownloads(items_ch)
+	showTopTwoDownloads(items_ch, &config)
 }
